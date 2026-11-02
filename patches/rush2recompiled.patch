@@ -25,11 +25,32 @@ index 741aa0a..c9f2ead 100644
  
  # The version shown in the launcher is the latest git tag (v1.0.8 -> 1.0.8), read when CMake configures; 0.1.0 without one.
  set(RUSH2_VERSION "0.1.0")
+diff --git a/include/data_files.h b/include/data_files.h
+index bdd880d..e708c49 100644
+--- a/include/data_files.h
++++ b/include/data_files.h
+@@ -16,6 +16,7 @@
+ //     "controllers"   each player's controller and the keyboard's player (src/input.cpp)
+ //     "bindings"      each player's controller and keyboard bindings (src/controls.cpp)
+ //     "control_profiles"  each game save profile's steering and rumble settings (src/control_profiles.cpp)
++//     "cheat_profiles"    the Cheats tab's named cheat loadouts and the one in use (src/cheats.cpp)
+ //
+ // Sections are passed as JSON text: the executable has two nlohmann::json versions on its include path (see
+ // src/rush2049/wings.cpp), so a json type can't cross files.
 diff --git a/include/rush2.h b/include/rush2.h
-index d72760e..e1e0d54 100644
+index d72760e..0d32663 100644
 --- a/include/rush2.h
 +++ b/include/rush2.h
-@@ -192,6 +192,11 @@ namespace rush2 {
+@@ -137,6 +137,8 @@ namespace rush2 {
+     // Cheats tab: the in-game cheat menu and forced cheats (src/cheats.cpp).
+     namespace cheats {
+         void create_tab();
++        // Reads the cheat profiles and applies the one in use. Call once the config has loaded.
++        void load_profiles();
+         // The Cheats tab's unlocks, and the unlock system's option (shown on the Progress tab; src/unlocks.cpp).
+         bool unlock_all_cars();
+         bool unlock_all_tracks();
+@@ -192,6 +194,11 @@ namespace rush2 {
  
          // Remembers rdram so input reads can tell races from menus. Called from a game thread hook every frame.
          void set_rdram(uint8_t* rdram);
@@ -54,8 +75,633 @@ index f933a25..5fc1fc8 100644
          }
          if (signature == model_signature) return;
          model_signature = signature;
+diff --git a/src/cheats.cpp b/src/cheats.cpp
+index 3292287..cd623b5 100644
+--- a/src/cheats.cpp
++++ b/src/cheats.cpp
+@@ -36,6 +36,18 @@
+ // - No Subways or Buses: subway_init (func_800A4210) leaves the trains' count (0x800D4E74) and pseudo-car pointer
+ //   (0x800D50E4) at 0 as it does on a track without trains, so New York's subway trains and SF Rush Sunset's buses
+ //   (src/rush1/track1_buses.cpp, which share the system) are never made. Read at race setup.
++//
++// Cheat profiles: named snapshots of every option on this tab (the cheats, the unlocks and Enable Cheat Menu, but not
++// Unlock System, which belongs to the Progress tab), made and picked in the tab's Unlocks group. Picking a profile sets
++// those options to its values; New saves the current values under a name typed on the tab's on-screen keyboard (the
++// console has no keyboard of its own), Save writes them into the profile in use, Delete removes it. The profile in use
++// is applied again at startup, after the config loads (rush2::cheats::load_profiles), so changes not saved to it are
++// dropped then. "None" uses no profile: the options stay as they were left, as before profiles existed. Kept in
++// players.json's "cheat_profiles" section (include/data_files.h):
++//   { "version": 1, "active": "RACER", "profiles": [ { "name": "RACER", "options": { "cheat_super_speed": true,
++//     "cheat_gravity": 0, ... } } ] }
++// A bool option is stored as true or false, a selector as its choice index. An option missing from a profile (one
++// added in a later version) is set to its default when the profile is applied.
+ 
+ #include <algorithm>
+ #include <array>
+@@ -45,6 +57,8 @@
+ #include <variant>
+ #include <vector>
+ 
++#include "json/json.hpp"
++
+ #include "recompui/recompui.h"
+ #include "recompui/config.h"
+ #include "librecomp/config.hpp"
+@@ -60,6 +74,8 @@
+ #include "battle.h"
+ #include "car2049.h"
+ #include "car_mods.h"
++#include "data_files.h"
++#include "options_page.h"
+ #include "track2049.h"
+ #include "track_mod_runtime.h"
+ #include "unlocks.h"
+@@ -252,6 +268,207 @@ namespace {
+     const std::string unlock_system_id = "unlock_system";
+     std::atomic<bool> unlock_system_enabled = true;
+ 
++    // Cheat profiles (see the top of the file). Used from the main thread at startup and from the UI thread after it,
++    // never both at once, like the config itself.
++    namespace profiles {
++        const std::string section = "cheat_profiles";
++        constexpr int version = 1;
++        constexpr size_t max_name = 16;
++
++        struct Profile {
++            std::string name;
++            std::vector<std::pair<std::string, recomp::config::ConfigValueVariant>> values;
++        };
++
++        std::vector<Profile> list;
++        std::string active; // "" when no profile is in use.
++
++        // Every option a profile holds: the tab's options except Unlock System.
++        const std::vector<std::string>& option_ids() {
++            static const std::vector<std::string> ids = [] {
++                std::vector<std::string> out = { cheat_menu_id, unlock_tracks_id, unlock_cars_id, unlock_parts_id,
++                                                 weapons_id, kill_floor_id, no_trains_id };
++                for (const Cheat& cheat : cheat_list) {
++                    out.push_back(cheat.id);
++                }
++                return out;
++            }();
++            return ids;
++        }
++
++        recomp::config::ConfigValueVariant default_of(const recomp::config::ConfigOption& option) {
++            if (option.type == recomp::config::ConfigOptionType::Bool) {
++                return std::get<recomp::config::ConfigOptionBool>(option.variant).default_value;
++            }
++            return std::get<recomp::config::ConfigOptionEnum>(option.variant).default_value;
++        }
++
++        // A stored value if it fits the option (right type, a choice that exists), otherwise the option's default.
++        recomp::config::ConfigValueVariant valid_or_default(const recomp::config::ConfigOption& option,
++                                                            const recomp::config::ConfigValueVariant* value) {
++            if (value != nullptr) {
++                if (option.type == recomp::config::ConfigOptionType::Bool && std::holds_alternative<bool>(*value)) {
++                    return *value;
++                }
++                if (option.type == recomp::config::ConfigOptionType::Enum && std::holds_alternative<uint32_t>(*value) &&
++                    std::get<uint32_t>(*value) <
++                        std::get<recomp::config::ConfigOptionEnum>(option.variant).options.size()) {
++                    return *value;
++                }
++            }
++            return default_of(option);
++        }
++
++        Profile* find_profile(const std::string& name) {
++            for (Profile& p : list) {
++                if (p.name == name) {
++                    return &p;
++                }
++            }
++            return nullptr;
++        }
++
++        const recomp::config::ConfigValueVariant* value_in(const Profile& p, const std::string& id) {
++            for (const auto& [key, value] : p.values) {
++                if (key == id) {
++                    return &value;
++                }
++            }
++            return nullptr;
++        }
++
++        void save() {
++            nlohmann::json profiles_json = nlohmann::json::array();
++            for (const Profile& p : list) {
++                nlohmann::json options = nlohmann::json::object();
++                for (const auto& [id, value] : p.values) {
++                    if (std::holds_alternative<bool>(value)) {
++                        options[id] = std::get<bool>(value);
++                    }
++                    else if (std::holds_alternative<uint32_t>(value)) {
++                        options[id] = std::get<uint32_t>(value);
++                    }
++                }
++                profiles_json.push_back({ { "name", p.name }, { "options", options } });
++            }
++            nlohmann::json out = { { "version", version }, { "active", active }, { "profiles", profiles_json } };
++            rush2::data_files::write(rush2::data_files::File::Players, section, out.dump());
++        }
++
++        void load() {
++            list.clear();
++            active.clear();
++            std::string text = rush2::data_files::read(rush2::data_files::File::Players, section);
++            if (text.empty()) {
++                return;
++            }
++            nlohmann::json in = nlohmann::json::parse(text, nullptr, false);
++            if (!in.is_object()) {
++                return;
++            }
++            if (in.contains("profiles") && in["profiles"].is_array()) {
++                for (const auto& entry : in["profiles"]) {
++                    if (!entry.is_object() || !entry.contains("name") || !entry["name"].is_string()) {
++                        continue;
++                    }
++                    Profile p{ entry["name"].get<std::string>() };
++                    if (p.name.empty() || find_profile(p.name) != nullptr) {
++                        continue;
++                    }
++                    if (entry.contains("options") && entry["options"].is_object()) {
++                        for (const auto& [id, value] : entry["options"].items()) {
++                            if (value.is_boolean()) {
++                                p.values.emplace_back(id, value.get<bool>());
++                            }
++                            else if (value.is_number_unsigned()) {
++                                p.values.emplace_back(id, value.get<uint32_t>());
++                            }
++                        }
++                    }
++                    list.push_back(std::move(p));
++                }
++            }
++            if (in.contains("active") && in["active"].is_string()) {
++                std::string name = in["active"].get<std::string>();
++                if (find_profile(name) != nullptr) {
++                    active = name;
++                }
++            }
++        }
++
++        // The tab's current values under a name: a new profile, or replacing the one of that name. It becomes the
++        // profile in use.
++        void store_current(const std::string& name) {
++            recomp::config::Config& config = recompui::config::get_config(config_id);
++            Profile p{ name };
++            for (const std::string& id : option_ids()) {
++                p.values.emplace_back(id, config.get_option_value(id));
++            }
++            if (Profile* existing = find_profile(name)) {
++                *existing = std::move(p);
++            }
++            else {
++                list.push_back(std::move(p));
++            }
++            active = name;
++            save();
++        }
++
++        // Sets the tab's options to a profile's values (the change callbacks pass them on to the game) and makes it the
++        // profile in use.
++        void apply(const std::string& name) {
++            const Profile* p = find_profile(name);
++            if (p == nullptr) {
++                return;
++            }
++            recomp::config::Config& config = recompui::config::get_config(config_id);
++            for (const std::string& id : option_ids()) {
++                config.set_option_value(id, valid_or_default(config.get_option(id), value_in(*p, id)));
++            }
++            config.save_config();
++            active = name;
++            save();
++        }
++
++        void use_none() {
++            active.clear();
++            save();
++        }
++
++        void remove(const std::string& name) {
++            list.erase(std::remove_if(list.begin(), list.end(), [&](const Profile& p) { return p.name == name; }),
++                       list.end());
++            if (active == name) {
++                active.clear();
++            }
++            save();
++        }
++
++        // Whether the tab's options still hold the profile in use's values.
++        bool active_matches() {
++            const Profile* p = find_profile(active);
++            if (p == nullptr) {
++                return true;
++            }
++            recomp::config::Config& config = recompui::config::get_config(config_id);
++            for (const std::string& id : option_ids()) {
++                if (config.get_option_value(id) != valid_or_default(config.get_option(id), value_in(*p, id))) {
++                    return false;
++                }
++            }
++            return true;
++        }
++
++        // The profile names in order, to tell when the picker needs rebuilding.
++        std::string names_key() {
++            std::string key;
++            for (const Profile& p : list) {
++                key += p.name + '\n';
++            }
++            return key;
++        }
++    }
++
+     void write_choice(uint8_t* rdram, const Cheat& cheat, const Choice& choice) {
+         MEM_B(0, (int32_t)cheat.address) = choice.value;
+         if (cheat.address2 != 0) {
+@@ -328,6 +545,9 @@ namespace {
+         },
+     };
+ 
++    // The group the cheat profile controls go under.
++    constexpr std::string_view profiles_group = "Unlocks";
++
+     const std::string page_description =
+         "Cheats apply to every race until they're turned off. Changes made in the game's own Cheats screen show up "
+         "here too.";
+@@ -393,7 +613,7 @@ namespace {
+             Button* reset = context.create_element<Button>(top->get_right(), "Reset Cheats", ButtonStyle::Secondary);
+             reset->add_pressed_callback([this]() { reset_cheats(); });
+ 
+-            Element* grid = context.create_element<Element>(left, 0, "div", false);
++            grid = context.create_element<Element>(left, 0, "div", false);
+             grid->set_display(Display::Flex);
+             grid->set_flex_direction(FlexDirection::Row);
+             grid->set_gap(32.0f);
+@@ -417,9 +637,15 @@ namespace {
+                     for (const std::string& id : group.ids) {
+                         add_row(column, config, id);
+                     }
++                    if (std::string_view(group.title) == profiles_group) {
++                        add_profile_rows(column);
++                    }
+                 }
+             }
+ 
++            // The name entry for New, shown in place of the columns.
++            add_keyboard(left);
++
+             description = context.create_element<Element>(left, 0, "p", true);
+             description->set_typography(theme::Typography::Body);
+             description->set_line_height(28.0f);
+@@ -427,6 +653,7 @@ namespace {
+             description->set_min_height(64.0f);
+             description->set_color(theme::color::TextDim);
+ 
++            refresh_profiles();
+             queue_update();
+         }
+ 
+@@ -458,6 +685,11 @@ namespace {
+                         row.select->set_selection(std::to_string(std::get<uint32_t>(value)));
+                     }
+                 }
++                refresh_profiles();
++                if (pending_focus != nullptr) {
++                    pending_focus->focus();
++                    pending_focus = nullptr;
++                }
+                 queue_update();
+             }
+         }
+@@ -471,9 +703,300 @@ namespace {
+             bool enabled = true;
+         };
+         std::vector<Row> rows;
++        recompui::Element* grid = nullptr;
+         recompui::Element* description = nullptr;
+         std::vector<recompui::Element*> columns_with_rows;
+ 
++        // Cheat profiles (see the top of the file).
++        recompui::Element* picker_holder = nullptr;
++        recompui::Select* picker = nullptr;
++        recompui::Button* new_button = nullptr;
++        recompui::Button* save_button = nullptr;
++        recompui::Button* delete_button = nullptr;
++        recompui::Label* profile_status = nullptr;
++        std::string shown_names = "\x01";   // Never a names_key(), so the first refresh builds the picker.
++        std::string shown_status;
++        std::string shown_active;
++        bool setting_picker = false;    // set_selection runs the change callbacks; they ignore it.
++        bool delete_armed = false;
++        bool delete_shows_armed = false;
++        // Focused at the next update: an element shown this frame can't take focus until it's laid out.
++        recompui::Element* pending_focus = nullptr;
++        // The name entry.
++        recompui::Element* keyboard = nullptr;
++        recompui::Label* typed_label = nullptr;
++        recompui::Button* keyboard_save = nullptr;
++        recompui::Button* first_key = nullptr;
++        std::string typed;
++
++        static constexpr const char* none_value = "none";
++        static constexpr const char* profile_prefix = "p:";
++
++        void show_text(const std::string& text) {
++            if (description != nullptr) {
++                description->set_text_unsafe(text);
++            }
++        }
++
++        // A row of the profile controls: a FocusRow (it scrolls into view and shows its description), laid out like the
++        // option rows.
++        recompui::Element* add_profile_row(recompui::Element* column, const std::string& text) {
++            using namespace recompui;
++            Element* row = get_current_context().create_element<rush2::ui::FocusRow>(column,
++                [this, text]() { show_text(text); });
++            row->set_display(Display::Flex);
++            row->set_flex_direction(FlexDirection::Row);
++            row->set_align_items(AlignItems::Center);
++            row->set_gap(12.0f);
++            row->set_height(48.0f);
++            row->set_as_navigation_container(NavigationType::Horizontal);
++            return row;
++        }
++
++        void add_profile_rows(recompui::Element* column) {
++            using namespace recompui;
++            ContextId context = get_current_context();
++            columns_with_rows.push_back(column);
++
++            Element* pick_row = add_profile_row(column,
++                "Pick a <recomp-color primary>cheat profile</recomp-color> to switch every option on this tab to the "
++                "ones saved in it. The profile in use is picked again each time the game starts. "
++                "<recomp-color primary>None</recomp-color> leaves the options as they are.");
++            Label* name = context.create_element<Label>(pick_row, "Cheat Profile", theme::Typography::LabelMD);
++            name->set_flex_grow(1.0f);
++            name->set_white_space(WhiteSpace::Nowrap);
++            picker_holder = context.create_element<Element>(pick_row, 0, "div", false);
++            picker_holder->set_width(192.0f);     // The select's minimum width.
++            picker_holder->set_flex_shrink(0.0f);
++
++            Element* button_row = add_profile_row(column,
++                "<recomp-color primary>New</recomp-color> saves the options on this tab as a new profile with a name you "
++                "enter. <recomp-color primary>Save</recomp-color> writes them into the profile in use. "
++                "<recomp-color primary>Delete</recomp-color> (press it twice) removes the profile in use; the options "
++                "stay as they are.");
++            new_button = context.create_element<Button>(button_row, "New", ButtonStyle::Secondary, ButtonSize::Small);
++            new_button->add_pressed_callback([this]() { open_keyboard(); });
++            save_button = context.create_element<Button>(button_row, "Save", ButtonStyle::Secondary, ButtonSize::Small);
++            save_button->add_pressed_callback([this]() {
++                delete_armed = false;
++                if (!profiles::active.empty()) {
++                    profiles::store_current(profiles::active);
++                }
++            });
++            delete_button = context.create_element<Button>(button_row, "Delete", ButtonStyle::Secondary, ButtonSize::Small);
++            delete_button->add_pressed_callback([this]() {
++                if (profiles::active.empty()) {
++                    return;
++                }
++                if (!delete_armed) {
++                    delete_armed = true;
++                    delete_shows_armed = true;
++                    delete_button->set_text("Press Again");
++                    return;
++                }
++                delete_armed = false;
++                profiles::remove(profiles::active);
++            });
++
++            profile_status = context.create_element<Label>(column, "", theme::Typography::LabelSM);
++            profile_status->set_color(theme::color::TextDim);
++            profile_status->set_margin_bottom(4.0f);
++        }
++
++        // Follows the profiles: rebuilds the picker when the names change (only then, so it keeps its focus while it
++        // is used), and keeps the buttons and the status line up to date.
++        void refresh_profiles() {
++            using namespace recompui;
++            if (picker_holder == nullptr) {
++                return;
++            }
++            std::string names = profiles::names_key();
++            if (names != shown_names) {
++                shown_names = names;
++                picker_holder->clear_children();
++                std::vector<SelectOption> options;
++                options.emplace_back("None", none_value);
++                for (const profiles::Profile& p : profiles::list) {
++                    options.emplace_back(p.name, profile_prefix + p.name);
++                }
++                std::string selected = profiles::active.empty() ? none_value : profile_prefix + profiles::active;
++                std::string text = "Pick a cheat profile, or None.";
++                picker = get_current_context().create_element<CheatSelect>(picker_holder, options, selected,
++                    [this, text]() { show_text(text); });
++                shown_active = profiles::active;
++                picker->add_change_callback([this](SelectOption& choice, int) {
++                    if (setting_picker) {
++                        return;
++                    }
++                    delete_armed = false;
++                    if (choice.value == none_value) {
++                        profiles::use_none();
++                    }
++                    else {
++                        profiles::apply(choice.value.substr(std::string_view(profile_prefix).size()));
++                    }
++                });
++            }
++
++            // The profile in use changed without the names changing (New over an existing name): follow it.
++            if (profiles::active != shown_active) {
++                shown_active = profiles::active;
++                setting_picker = true;
++                picker->set_selection(profiles::active.empty() ? std::string(none_value)
++                                                               : profile_prefix + profiles::active);
++                setting_picker = false;
++            }
++
++            bool in_use = !profiles::active.empty();
++            if (save_button->is_enabled() != in_use) {
++                save_button->set_enabled(in_use);
++                delete_button->set_enabled(in_use);
++            }
++            if (!delete_armed && delete_shows_armed) {
++                delete_shows_armed = false;
++                delete_button->set_text("Delete");
++            }
++            std::string status;
++            if (!in_use) {
++                status = profiles::list.empty() ? "No profiles yet: set the cheats, then press New."
++                                                 : "No profile in use.";
++            }
++            else if (profiles::active_matches()) {
++                status = "Using " + profiles::active + ". Picked again at startup.";
++            }
++            else {
++                status = "Changed since " + profiles::active + " was saved. Save to keep the changes.";
++            }
++            if (status != shown_status) {
++                shown_status = status;
++                profile_status->set_text(status);
++            }
++        }
++
++        // An on-screen keyboard for the profile name: letters, digits, a few marks, Space and Delete, then Cancel and
++        // Save. Shown in place of the columns while New is in progress.
++        void add_keyboard(recompui::Element* parent) {
++            using namespace recompui;
++            ContextId context = get_current_context();
++            keyboard = context.create_element<Element>(parent, 0, "div", false);
++            keyboard->set_display(Display::None);
++            keyboard->set_flex_direction(FlexDirection::Column);
++            keyboard->set_align_items(AlignItems::Center);
++            keyboard->set_gap(8.0f);
++            keyboard->set_width(100.0f, Unit::Percent);
++            keyboard->set_as_navigation_container(NavigationType::Vertical);
++
++            Label* title = context.create_element<Label>(keyboard, "New Cheat Profile", theme::Typography::LabelLG);
++            title->set_margin_bottom(4.0f);
++            typed_label = context.create_element<Label>(keyboard, "_", theme::Typography::LabelLG);
++            typed_label->set_min_width(480.0f);
++            typed_label->set_padding(12.0f);
++            typed_label->set_margin_bottom(8.0f);
++            typed_label->set_text_align(TextAlign::Center);
++            typed_label->set_border_bottom_width(1.0f);
++            typed_label->set_border_bottom_color(theme::color::Border);
++
++            const std::vector<std::string> key_rows = { "ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ0123", "456789-!." };
++            for (const std::string& keys : key_rows) {
++                Element* row = make_key_row();
++                for (char c : keys) {
++                    Button* key = make_key(row, std::string(1, c));
++                    key->add_pressed_callback([this, c]() { type(c); });
++                    if (first_key == nullptr) {
++                        first_key = key;
++                    }
++                }
++                if (&keys == &key_rows.back()) {
++                    make_key(row, "Space")->add_pressed_callback([this]() { type(' '); });
++                }
++            }
++            Element* edit_row = make_key_row();
++            make_key(edit_row, "Delete")->add_pressed_callback([this]() {
++                if (!typed.empty()) {
++                    typed.pop_back();
++                    show_typed();
++                }
++            });
++            make_key(edit_row, "Clear")->add_pressed_callback([this]() {
++                typed.clear();
++                show_typed();
++            });
++
++            Element* actions = make_key_row();
++            actions->set_margin_top(8.0f);
++            Button* cancel = context.create_element<Button>(actions, "Cancel", ButtonStyle::Secondary, ButtonSize::Medium);
++            cancel->add_pressed_callback([this]() { close_keyboard(); });
++            keyboard_save = context.create_element<Button>(actions, "Save Profile", ButtonStyle::Primary,
++                                                           ButtonSize::Medium);
++            keyboard_save->add_pressed_callback([this]() {
++                std::string name = trimmed(typed);
++                if (name.empty()) {
++                    return;
++                }
++                profiles::store_current(name);
++                close_keyboard();
++            });
++        }
++
++        recompui::Element* make_key_row() {
++            using namespace recompui;
++            Element* row = get_current_context().create_element<rush2::ui::FocusRow>(keyboard, nullptr);
++            row->set_display(Display::Flex);
++            row->set_flex_direction(FlexDirection::Row);
++            row->set_justify_content(JustifyContent::Center);
++            row->set_gap(8.0f);
++            row->set_as_navigation_container(NavigationType::Horizontal);
++            return row;
++        }
++
++        recompui::Button* make_key(recompui::Element* row, const std::string& text) {
++            using namespace recompui;
++            Button* key = get_current_context().create_element<Button>(row, text, ButtonStyle::Secondary,
++                                                                       ButtonSize::Medium);
++            key->set_min_width(64.0f);
++            return key;
++        }
++
++        static std::string trimmed(const std::string& s) {
++            size_t a = s.find_first_not_of(' ');
++            if (a == std::string::npos) {
++                return "";
++            }
++            return s.substr(a, s.find_last_not_of(' ') - a + 1);
++        }
++
++        void type(char c) {
++            if (typed.size() < profiles::max_name && !(c == ' ' && typed.empty())) {
++                typed.push_back(c);
++                show_typed();
++            }
++        }
++
++        void show_typed() {
++            typed_label->set_text(typed.size() < profiles::max_name ? typed + "_" : typed);
++            keyboard_save->set_enabled(!trimmed(typed).empty());
++        }
++
++        void open_keyboard() {
++            using namespace recompui;
++            delete_armed = false;
++            typed.clear();
++            show_typed();
++            grid->set_display(Display::None);
++            keyboard->set_display(Display::Flex);
++            show_text("Enter a name for the profile, then press <recomp-color primary>Save Profile</recomp-color>. It "
++                      "saves the options on this tab as they are now. A name already in use replaces that profile.");
++            pending_focus = first_key;
++        }
++
++        void close_keyboard() {
++            using namespace recompui;
++            keyboard->set_display(Display::None);
++            grid->set_display(Display::Flex);
++            show_text("");
++            pending_focus = new_button;
++        }
++
+         bool column_has_rows(recompui::Element* column) {
+             return std::find(columns_with_rows.begin(), columns_with_rows.end(), column) != columns_with_rows.end();
+         }
+@@ -796,6 +1319,19 @@ extern "C" void rush2_cheats_kill_floor(uint8_t* rdram, recomp_context* ctx) {
+     }
+ }
+ 
++// Startup, after the config has loaded: reads the cheat profiles and applies the one last in use, so the game starts
++// with its cheats whatever was changed without saving it.
++void rush2::cheats::load_profiles() {
++    profiles::load();
++    if (profiles::active.empty()) {
++        return;
++    }
++    profiles::apply(profiles::active);
++    // Nothing has been forced in game yet, so turning an unlock or the cheat menu off here has nothing to put back.
++    cheat_menu_restore_pending = false;
++    unlock_tracks_restore_pending = false;
++}
++
+ bool rush2::cheats::unlock_system() {
+     return unlock_system_enabled.load(std::memory_order_relaxed);
+ }
 diff --git a/src/config.cpp b/src/config.cpp
-index b674433..70042cb 100644
+index b674433..526864f 100644
 --- a/src/config.cpp
 +++ b/src/config.cpp
 @@ -30,6 +30,9 @@
@@ -133,6 +779,12 @@ index b674433..70042cb 100644
      rush2::input::load_players();
      rush2::controls::load();
      rush2::wings::load_config();
+@@ -999,4 +1037,5 @@ void rush2::init_config() {
+     rush2::circuit::load_config();
+     rush2::track1::load_config();
+     rush2::music::load_config();
++    rush2::cheats::load_profiles();
+ }
 diff --git a/src/controls.cpp b/src/controls.cpp
 index fed2ac0..3ce394f 100644
 --- a/src/controls.cpp

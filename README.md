@@ -54,10 +54,23 @@ The tabs, from left to right:
 | Controls | Button bindings and rumble |
 | Progress | Unlocks and collectibles |
 | Games | San Francisco Rush and Rush 2049: their ROMs and what they add (see below), and the battle settings |
-| Cheats | The game's cheats |
+| Cheats | The game's cheats, and cheat profiles (see below) |
 | Mods | Installed mods |
 
 Each option shows its description in the menu.
+
+### Cheat profiles
+
+A cheat profile saves every option on the Cheats tab under a name, so you can keep a set for racing and
+another for the stunt arena and switch between them. The controls are in the tab's **Unlocks** group.
+
+1. Switch on the cheats you want (and Enable Cheat Menu or the unlocks, if you want those too).
+2. Press **New**, type a name on the on-screen keyboard, then **Save Profile**.
+3. Pick a profile under **Cheat Profile** to switch every option to it. **None** leaves them as they are.
+
+**Save** writes the current options into the profile in use, and **Delete** (press it twice) removes it.
+The profile in use is picked again every time the game starts, so changes you did not save to it are
+dropped then. Profiles are kept in `players.json` in the title folder. Not tested on a console yet.
 
 Differences on the PS5:
 

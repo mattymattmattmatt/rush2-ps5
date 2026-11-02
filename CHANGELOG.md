@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). Versions follow
 the title's `contentVersion` in `sce_sys/param.json`.
 
+## [Unreleased]
+
+### Added
+- Cheat profiles on the Cheats tab, in its Unlocks group: New saves every option
+  on the tab under a name typed on an on-screen keyboard, Cheat Profile switches
+  between them, Save and Delete update or remove the profile in use. The profile
+  in use is applied again at every start. Kept in `players.json`.
+
 ## [00.003.000] - 2026-10-16
 
 ### Added
