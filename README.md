@@ -59,6 +59,13 @@ The tabs, from left to right:
 
 Each option shows its description in the menu.
 
+### Live stunt score
+
+In stunt mode the trick box normally shows a trick only once you land it. With **General → Gameplay → Live Stunt
+Score** on (the default), the box shows the trick while you do it: the flips, rolls, air time or two-wheel run so far
+and the points they would score if you landed now. If you wreck, the trick you lost stays up for a moment. Switch it
+off for the original behavior. Not tested on a console yet.
+
 ### Cheat profiles
 
 A cheat profile saves every option on the Cheats tab under a name, so you can keep a set for racing and

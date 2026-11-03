@@ -11,6 +11,9 @@ the title's `contentVersion` in `sce_sys/param.json`.
   on the tab under a name typed on an on-screen keyboard, Cheat Profile switches
   between them, Save and Delete update or remove the profile in use. The profile
   in use is applied again at every start. Kept in `players.json`.
+- Live Stunt Score (General → Gameplay, on by default): the stunt mode trick box
+  shows the trick in progress and what it would score if you landed now, not
+  only once you land. A trick lost to a wreck stays up for a moment.
 
 ## [00.003.000] - 2026-10-16
 
